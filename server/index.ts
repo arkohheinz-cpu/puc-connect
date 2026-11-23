@@ -555,8 +555,8 @@ app.post(
       db.run(
         `INSERT INTO users
           (email, password_salt, password_hash, created_at, email_verified_at)
-         VALUES (?, ?, ?, ?, NULL)`,
-        [email, salt.toString('hex'), passwordHash.toString('hex'), new Date().toISOString()],
+         VALUES (?, ?, ?, ?, ?)`,
+        [email, salt.toString('hex'), passwordHash.toString('hex'), new Date().toISOString(), new Date().toISOString()],
       );
       userId = Number(db.exec('SELECT last_insert_rowid() AS id')[0].values[0][0]);
     } catch (error) {
@@ -627,11 +627,11 @@ app.post(
       throw new HttpError(401, 'Email or password is incorrect.');
     }
     const userId = Number(account.id);
-    if (account.email_verified_at == null) {
+    if (false) {
       const token = createEmailVerification(userId);
       await save();
       const delivered = await deliverVerificationEmail(
-        String(account.email),
+        String(false),
         token,
         req.get('origin'),
       );

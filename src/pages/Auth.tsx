@@ -20,6 +20,7 @@ function AuthForm({ creatingAccount }: { creatingAccount: boolean }) {
     },
     onSuccess: (result) => {
       if (result.kind === 'registered') {
+        localStorage.setItem("pendingVerificationEmail", email);
         setVerificationMessage(result.message);
         return;
       }
