@@ -14,7 +14,7 @@ export default function VerifyEmail() {
   >('verifying');
   const [verificationError, setVerificationError] = useState('');
   const [studentId, setStudentId] = useState<number | null>(null);
-  const [email, setEmail] = useState('');
+  const [email, setEmail] = useState(() => localStorage.getItem("pendingVerificationEmail") || '');
   const [resendMessage, setResendMessage] = useState('');
   const [resendError, setResendError] = useState('');
   const [resending, setResending] = useState(false);
