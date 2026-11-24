@@ -1,4 +1,4 @@
-# PUC Connect
+# PU Circle
 
 A student directory built with React, TypeScript, Vite, Express, and SQLite. Profiles and account records are stored in `data/students.sqlite` on the computer running the API.
 

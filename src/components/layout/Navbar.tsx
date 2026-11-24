@@ -38,11 +38,11 @@ export function Navbar({
   return (
     <header className="site-header">
       <div className="header-inner">
-        <Link href="/" className="brand" aria-label="PUC Connect home">
+        <Link href="/" className="brand" aria-label="PU Circle home">
           <span className="brand-mark">
             <img src="/pentecost-university-logo.jpg" alt="" />
           </span>
-          <span>PUC Connect</span>
+          <span>PU Circle</span>
         </Link>
         {user ? (
           <div className="menu-wrapper" ref={menuRef}>

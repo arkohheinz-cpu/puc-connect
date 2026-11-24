@@ -160,9 +160,9 @@ export async function sendVerificationEmail(
   await mailer.sendMail({
     from: config.from,
     to: email,
-    subject: 'Verify your PUC Connect email',
-    text: `Verify your email address to activate your PUC Connect account: ${link}\n\nThis link expires in 24 hours. If you did not create an account, you can ignore this message.`,
-    html: `<p>Verify your email address to activate your PUC Connect account.</p><p><a href="${link}">Verify email</a></p><p>This link expires in 24 hours. If you did not create an account, you can ignore this message.</p>`,
+    subject: 'Verify your PU Circle email',
+    text: `Verify your email address to activate your PU Circle account: ${link}\n\nThis link expires in 24 hours. If you did not create an account, you can ignore this message.`,
+    html: `<p>Verify your email address to activate your PU Circle account.</p><p><a href="${link}">Verify email</a></p><p>This link expires in 24 hours. If you did not create an account, you can ignore this message.</p>`,
   });
   return true;
 }

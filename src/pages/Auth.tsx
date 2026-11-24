@@ -51,7 +51,7 @@ function AuthForm({ creatingAccount }: { creatingAccount: boolean }) {
   return (
     <section className="content-section form-page">
       <div className="page-heading">
-        <span className="eyebrow">PUC Connect account</span>
+        <span className="eyebrow">PU Circle account</span>
         <h1>{creatingAccount ? 'Create your account' : 'Sign in'}</h1>
         <p>
           {creatingAccount
@@ -167,7 +167,7 @@ function AuthForm({ creatingAccount }: { creatingAccount: boolean }) {
         )}
       </div>
       <p className="privacy-note">
-        {creatingAccount ? 'Already have an account? ' : 'New to PUC Connect? '}
+        {creatingAccount ? 'Already have an account? ' : 'New to PU Circle? '}
         <Link href={creatingAccount ? '/login' : '/register'}>
           {creatingAccount ? 'Sign in' : 'Create an account'}
         </Link>
