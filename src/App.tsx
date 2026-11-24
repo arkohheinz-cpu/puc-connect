@@ -4,12 +4,14 @@ import { Redirect, Route, Router as WouterRouter, Switch, useLocation } from 'wo
 import { Layout } from './components/layout/Layout';
 import { getAuthSession, signOut } from './api';
 import { Login, Register } from './pages/Auth';
+import Attendance from './pages/Attendance';
 import Directory from './pages/Directory';
 import EditProfile from './pages/EditProfile';
 import Home from './pages/Home';
 import Join from './pages/Join';
 import NotFound from './pages/NotFound';
 import Profile from './pages/Profile';
+import Resources from './pages/Resources';
 import VerifyEmail from './pages/VerifyEmail';
 
 const queryClient = new QueryClient({
@@ -23,7 +25,7 @@ function Router() {
   const [location, navigate] = useLocation();
   const auth = useQuery({
     queryKey: ['auth'],
-    queryFn: getAuthSession,
+    queryFn: ({ signal }) => getAuthSession(signal),
     staleTime: 30_000,
   });
   const logout = useMutation({
@@ -63,6 +65,8 @@ function Router() {
               <Switch>
                 <Route path="/" component={Home} />
                 <Route path="/directory" component={Directory} />
+                <Route path="/resources" component={Resources} />
+                <Route path="/attendance" component={Attendance} />
                 <Route path="/profile/:id" component={Profile} />
                 <Route path="/join" component={Join} />
                 <Route path="/edit/:id" component={EditProfile} />

@@ -8,7 +8,10 @@ import { StudentCard } from '../components/StudentCard';
 export default function Home() {
   const [, navigate] = useLocation();
   const [search, setSearch] = useState('');
-  const { data: auth } = useQuery({ queryKey: ['auth'], queryFn: getAuthSession });
+  const { data: auth } = useQuery({
+    queryKey: ['auth'],
+    queryFn: ({ signal }) => getAuthSession(signal),
+  });
   const studentId = auth?.user?.studentId;
   const { data: stats, error: statsError } = useQuery({ queryKey: ['stats'], queryFn: getStats });
   const {

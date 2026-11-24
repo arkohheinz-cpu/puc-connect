@@ -14,16 +14,20 @@ function AuthForm({ creatingAccount }: { creatingAccount: boolean }) {
   const submit = useMutation({
     mutationFn: async () => {
       if (creatingAccount) {
-        return { kind: 'registered' as const, ...(await register(email, password)) };
+        const result = await register(email, password);
+        return 'csrfToken' in result
+          ? { kind: 'signed-in' as const, session: result }
+          : { kind: 'registered' as const, message: result.message };
       }
       return { kind: 'signed-in' as const, session: await signIn(email, password) };
     },
-    onSuccess: (result) => {
+    onSuccess: async (result) => {
       if (result.kind === 'registered') {
         localStorage.setItem("pendingVerificationEmail", email);
         setVerificationMessage(result.message);
         return;
       }
+      await queryClient.cancelQueries({ queryKey: ['auth'] });
       queryClient.setQueryData(['auth'], result.session);
       navigate(
         result.session.user?.studentId
@@ -142,7 +146,7 @@ function AuthForm({ creatingAccount }: { creatingAccount: boolean }) {
                 )}
               {creatingAccount && (
                 <p className="field-hint">
-                  You must verify your email before signing in.
+                  After creating your account, you’ll add your student profile.
                 </p>
               )}
             </section>

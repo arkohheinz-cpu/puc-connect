@@ -25,6 +25,12 @@ The API is available at `http://127.0.0.1:3001`. In development, Vite proxies `/
 - Profile writes are authenticated and each account can create and edit only its own profile. The API also checks CSRF tokens, limits sign-in/registration attempts, and applies security response headers.
 - Existing profiles are kept but are unclaimed and cannot be edited by a new account. They are never automatically assigned based only on matching, unverified email addresses.
 
+## Study resources
+
+Signed-in students with a profile can share PDF, PowerPoint, and Word files, MP4/MOV/WebM videos (up to 500 MB each), and text announcements from the **Study resources** menu. Video uploads can set a playback start time and optional end time; the player previews that clip, while downloads contain the full video. Each item can be limited to a selected program or shared with all students. Students can view or download items they can access, and only the uploader can delete an item. Each account can share up to 25 items. Resource metadata is stored in SQLite; large files are streamed to the persistent `data/study-resources` directory beside the database. Back up this directory with the database. When deploying behind a reverse proxy, allow request bodies up to 500 MB and configure a suitable upload timeout.
+
+The separate **Attendance** menu is currently a placeholder. Attendance recording is planned for lecturers or class representatives to create class sessions and mark students present or absent.
+
 ## Hosting securely
 
 The server binds to `127.0.0.1` by default. To host it, place it behind an HTTPS reverse proxy and set `NODE_ENV=production` so cookies are marked `Secure`. Set `HOST=0.0.0.0` only when the proxy needs network access to the app. Set `TRUST_PROXY_HOPS` to the exact number of trusted proxy hops (usually `1` for one reverse proxy); do not trust arbitrary client-supplied forwarding headers.

@@ -1,7 +1,14 @@
-import type { AuthSession, Student, StudentInput, StudentStats } from './types';
+import type {
+  AuthSession,
+  Student,
+  StudentInput,
+  StudentStats,
+  StudyResource,
+  StudyResourceInput,
+  StudyResourceUploadInput,
+} from './types';
 
 let csrfToken: string | null = null;
-let authSessionRequest: Promise<AuthSession> | null = null;
 
 export class ApiError extends Error {
   constructor(
@@ -73,18 +80,11 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
-export function getAuthSession(): Promise<AuthSession> {
-  if (!authSessionRequest) {
-    authSessionRequest = request<AuthSession>('/api/auth/session')
-      .then((session) => {
-        csrfToken = session.csrfToken;
-        return session;
-      })
-      .finally(() => {
-        authSessionRequest = null;
-      });
-  }
-  return authSessionRequest;
+export function getAuthSession(signal?: AbortSignal): Promise<AuthSession> {
+  return request<AuthSession>('/api/auth/session', { signal }).then((session) => {
+    csrfToken = session.csrfToken;
+    return session;
+  });
 }
 
 async function submitAuth(
@@ -104,11 +104,16 @@ export function signIn(email: string, password: string): Promise<AuthSession> {
   return submitAuth('/api/auth/login', email, password);
 }
 
-export function register(email: string, password: string): Promise<{ message: string }> {
-  return request('/api/auth/register', {
+export async function register(
+  email: string,
+  password: string,
+): Promise<AuthSession | { message: string }> {
+  const result = await request<AuthSession | { message: string }>('/api/auth/register', {
     method: 'POST',
     body: JSON.stringify({ email, password }),
   });
+  if ('csrfToken' in result) csrfToken = result.csrfToken;
+  return result;
 }
 
 export async function verifyEmail(
@@ -199,4 +204,86 @@ export function listPrograms(department?: string): Promise<string[]> {
 
 export function getStats(): Promise<StudentStats> {
   return request('/api/stats');
+}
+
+export function listResourcePrograms(): Promise<string[]> {
+  return request('/api/resources/programs');
+}
+
+export function listStudyResources(program?: string): Promise<StudyResource[]> {
+  const query = program ? `?program=${encodeURIComponent(program)}` : '';
+  return request(`/api/resources${query}`);
+}
+
+export function createStudyResource(data: StudyResourceInput): Promise<StudyResource> {
+  return request('/api/resources', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function uploadStudyResource(
+  data: StudyResourceUploadInput,
+  file: File,
+  onProgress: (progress: number) => void,
+): Promise<StudyResource> {
+  const cookieToken = readCsrfCookie();
+  if (cookieToken) {
+    csrfToken = cookieToken;
+  } else if (!csrfToken) {
+    csrfToken = (await getAuthSession()).csrfToken;
+  }
+  const params = new URLSearchParams({
+    title: data.title,
+    program: data.program,
+    audience: data.audience,
+    fileName: data.fileName,
+  });
+  if (data.clipStart) params.set('clipStart', data.clipStart);
+  if (data.clipEnd) params.set('clipEnd', data.clipEnd);
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `/api/resources/upload?${params.toString()}`);
+    xhr.withCredentials = true;
+    xhr.setRequestHeader('Content-Type', data.mimeType);
+    if (csrfToken) xhr.setRequestHeader('X-CSRF-Token', csrfToken);
+    xhr.upload.addEventListener('progress', (event) => {
+      if (event.lengthComputable) {
+        onProgress(Math.round((event.loaded / event.total) * 100));
+      }
+    });
+    xhr.addEventListener('load', () => {
+      if (xhr.status < 200 || xhr.status >= 300) {
+        let errorMessage = `Request failed (${xhr.status}).`;
+        try {
+          const body = JSON.parse(xhr.responseText) as { error?: string };
+          if (body.error) errorMessage = body.error;
+        } catch {
+          errorMessage = `Request failed (${xhr.status}).`;
+        }
+        reject(new ApiError(errorMessage));
+        return;
+      }
+      try {
+        resolve(JSON.parse(xhr.responseText) as StudyResource);
+      } catch {
+        reject(new ApiError('The server returned an invalid upload response.'));
+      }
+    });
+    xhr.addEventListener('error', () => {
+      reject(new ApiError('A network error interrupted the upload.'));
+    });
+    xhr.addEventListener('abort', () => {
+      reject(new ApiError('The upload was cancelled.'));
+    });
+    xhr.send(file);
+  });
+}
+
+export function deleteStudyResource(id: number): Promise<void> {
+  return request(`/api/resources/${id}`, { method: 'DELETE' });
+}
+
+export function getStudyResourceDownloadUrl(id: number, asAttachment = false): string {
+  return `/api/resources/${id}/download${asAttachment ? '?download=1' : ''}`;
 }

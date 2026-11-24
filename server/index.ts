@@ -4,10 +4,13 @@ import express, {
   type Response,
 } from 'express';
 import { createHash, randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
-import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { createReadStream, createWriteStream, existsSync } from 'node:fs';
+import { rename, rm } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+import { Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import type { Database as SqlDatabase, SqlValue } from 'sql.js';
-import { openDatabase } from './database';
+import { openDatabase, studyResourceStorageDir } from './database';
 import {
   createDevelopmentVerificationUrl,
   sendVerificationEmail,
@@ -38,6 +41,19 @@ type StudentInput = Omit<
   StudentRecord,
   'id' | 'createdAt' | 'updatedAt' | 'ownerId'
 >;
+type ResourceAudience = 'program' | 'all';
+type StudyResourceKind = 'file' | 'video' | 'announcement';
+type StudyResourceInput = {
+  title: string;
+  program: string;
+  audience: ResourceAudience;
+  kind: StudyResourceKind;
+  fileName: string;
+  mimeType: string;
+  announcementBody: string;
+  clipStartSeconds: number | null;
+  clipEndSeconds: number | null;
+};
 type AuthenticatedUser = {
   id: number;
   email: string;
@@ -190,6 +206,143 @@ function parseStudentInput(body: unknown, current?: StudentRecord): StudentInput
   };
 }
 
+const MAX_STUDY_RESOURCE_BYTES = 500 * 1024 * 1024;
+const MAX_STUDY_RESOURCES_PER_USER = 25;
+const studyResourceTypes: Record<string, { mimeType: string; kind: 'file' | 'video' }> = {
+  '.pdf': { mimeType: 'application/pdf', kind: 'file' },
+  '.ppt': { mimeType: 'application/vnd.ms-powerpoint', kind: 'file' },
+  '.pptx': {
+    mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    kind: 'file',
+  },
+  '.doc': { mimeType: 'application/msword', kind: 'file' },
+  '.docx': {
+    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    kind: 'file',
+  },
+  '.mp4': { mimeType: 'video/mp4', kind: 'video' },
+  '.mov': { mimeType: 'video/quicktime', kind: 'video' },
+  '.webm': { mimeType: 'video/webm', kind: 'video' },
+};
+
+function resourceBaseFields(values: Record<string, unknown>): {
+  title: string;
+  program: string;
+  audience: ResourceAudience;
+} {
+  const title = typeof values.title === 'string' ? values.title.trim() : '';
+  const program = typeof values.program === 'string' ? values.program.trim() : '';
+  const audience = values.audience;
+  if (!title || title.length > 120) {
+    throw new HttpError(400, 'Title is required and must be 120 characters or fewer.');
+  }
+  if (!program || program.length > 120) {
+    throw new HttpError(400, 'Choose a valid program.');
+  }
+  if (audience !== 'program' && audience !== 'all') {
+    throw new HttpError(400, 'Choose who can view this resource.');
+  }
+  return { title, program, audience };
+}
+
+function parseStudyAnnouncement(body: unknown): StudyResourceInput {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw new HttpError(400, 'A resource object is required.');
+  }
+  const values = body as Record<string, unknown>;
+  if (values.kind !== 'announcement') {
+    throw new HttpError(400, 'Choose an announcement to post.');
+  }
+  const { title, program, audience } = resourceBaseFields(values);
+  const announcementBody =
+    typeof values.announcementBody === 'string' ? values.announcementBody.trim() : '';
+  if (!announcementBody || announcementBody.length > 5000) {
+    throw new HttpError(400, 'Announcement text is required and must be 5,000 characters or fewer.');
+  }
+  return {
+    title,
+    program,
+    audience,
+    kind: 'announcement',
+    fileName: '',
+    mimeType: '',
+    announcementBody,
+    clipStartSeconds: null,
+    clipEndSeconds: null,
+  };
+}
+
+function parseVideoTime(value: unknown, label: string, optional = false): number | null {
+  if ((value == null || value === '') && optional) return null;
+  if (typeof value !== 'string') {
+    throw new HttpError(400, `${label} must use HH:MM:SS format.`);
+  }
+  const match = /^(\d{1,6}):([0-5]\d):([0-5]\d)$/.exec(value);
+  if (!match) throw new HttpError(400, `${label} must use HH:MM:SS format.`);
+  const seconds = Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+  if (!Number.isSafeInteger(seconds)) {
+    throw new HttpError(400, `${label} is outside the supported range.`);
+  }
+  return seconds;
+}
+
+function parseStudyResourceUpload(query: unknown, mimeType: string): StudyResourceInput {
+  if (!query || typeof query !== 'object' || Array.isArray(query)) {
+    throw new HttpError(400, 'Resource upload details are required.');
+  }
+  const values = query as Record<string, unknown>;
+  const { title, program, audience } = resourceBaseFields(values);
+  const rawFileName = typeof values.fileName === 'string' ? values.fileName : '';
+  const fileName = rawFileName.replace(/\\/g, '/').split('/').pop()
+    ?.replace(/[\u0000-\u001f\u007f]/g, '').trim() ?? '';
+  if (!fileName || fileName.length > 180) {
+    throw new HttpError(400, 'Choose a file with a valid file name.');
+  }
+  const extension = fileName.slice(fileName.lastIndexOf('.')).toLowerCase();
+  const type = studyResourceTypes[extension];
+  if (!type || type.mimeType !== mimeType) {
+    throw new HttpError(400, 'Use a supported PDF, PowerPoint, Word, MP4, MOV, or WebM file.');
+  }
+  const clipStartSeconds =
+    type.kind === 'video' ? parseVideoTime(values.clipStart ?? '00:00:00', 'Clip start time') : null;
+  const clipEndSeconds =
+    type.kind === 'video' ? parseVideoTime(values.clipEnd, 'Clip end time', true) : null;
+  if (
+    clipStartSeconds !== null &&
+    clipEndSeconds !== null &&
+    clipEndSeconds <= clipStartSeconds
+  ) {
+    throw new HttpError(400, 'Clip end time must be after the start time.');
+  }
+  return {
+    title,
+    program,
+    audience,
+    kind: type.kind,
+    fileName,
+    mimeType,
+    announcementBody: '',
+    clipStartSeconds,
+    clipEndSeconds,
+  };
+}
+
+function hasValidResourceSignature(extension: string, signature: Buffer): boolean {
+  if (extension === '.pdf') return signature.subarray(0, 5).toString('ascii') === '%PDF-';
+  if (extension === '.doc' || extension === '.ppt') {
+    return signature.subarray(0, 8).equals(
+      Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]),
+    );
+  }
+  if (extension === '.docx' || extension === '.pptx') {
+    return signature.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]));
+  }
+  if (extension === '.webm') {
+    return signature.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
+  }
+  return signature.subarray(4, 8).toString('ascii') === 'ftyp';
+}
+
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const sessionCookieName =
   process.env.NODE_ENV === 'production' ? '__Host-puc_session' : 'puc_session';
@@ -306,6 +459,67 @@ function currentUser(req: Request): AuthenticatedUser {
     throw new HttpError(401, 'Sign in to continue.');
   }
   return req.authenticatedUser;
+}
+
+function currentStudentProgram(user: AuthenticatedUser): string {
+  const statement = db.prepare(
+    'SELECT program FROM students WHERE owner_id = ? AND id = ?',
+  );
+  statement.bind([user.id, user.studentId]);
+  const program = statement.step()
+    ? String(statement.getAsObject().program)
+    : undefined;
+  statement.free();
+  if (!program) {
+    throw new HttpError(403, 'Create your student profile before using study resources.');
+  }
+  return program;
+}
+
+function resourceStoragePath(storageKey: string): string {
+  if (!/^[a-f0-9]{32}\.(?:pdf|ppt|pptx|doc|docx|mp4|mov|webm)$/.test(storageKey)) {
+    throw new Error('Stored resource path is invalid.');
+  }
+  return join(studyResourceStorageDir, storageKey);
+}
+
+function storedResourceKeysForOwner(ownerId: number): string[] {
+  const statement = db.prepare(
+    'SELECT storage_key FROM study_resources WHERE owner_id = ? AND storage_key IS NOT NULL',
+  );
+  statement.bind([ownerId]);
+  const keys: string[] = [];
+  while (statement.step()) {
+    keys.push(String(statement.getAsObject().storage_key));
+  }
+  statement.free();
+  return keys;
+}
+
+async function removeStoredResources(storageKeys: string[]): Promise<void> {
+  await Promise.all(
+    storageKeys.map((storageKey) => rm(resourceStoragePath(storageKey), { force: true })),
+  );
+}
+
+function validateResourceProgram(program: string): void {
+  const statement = db.prepare('SELECT 1 FROM students WHERE program = ? LIMIT 1');
+  statement.bind([program]);
+  const exists = statement.step();
+  statement.free();
+  if (!exists) throw new HttpError(400, 'Choose a program in the directory.');
+}
+
+function assertStudyResourceCapacity(userId: number): void {
+  const statement = db.prepare(
+    'SELECT COUNT(*) AS count FROM study_resources WHERE owner_id = ?',
+  );
+  statement.bind([userId]);
+  const count = statement.step() ? Number(statement.getAsObject().count) : 0;
+  statement.free();
+  if (count >= MAX_STUDY_RESOURCES_PER_USER) {
+    throw new HttpError(409, 'You have reached the limit of 25 shared items.');
+  }
 }
 
 function derivePassword(password: string, salt: Buffer): Promise<Buffer> {
@@ -592,13 +806,12 @@ app.post(
       });
       return;
     }
-    const token = createEmailVerification(userId);
+    const session = createSession(userId);
     await save();
-    const delivered = await deliverVerificationEmail(email, token, req.get('origin'));
-    res.status(202).json({
-      message: delivered
-        ? 'If a verification message is needed, check your email.'
-        : 'Email is unavailable in this development server. Sign in with your password to get a one-time verification link.',
+    setSessionCookies(res, session);
+    res.status(201).json({
+      user: { id: userId, email, studentId: null },
+      csrfToken: session.csrfToken,
     });
   }),
 );
@@ -912,8 +1125,337 @@ app.delete(
     if (!student || student.ownerId !== user.id) {
       throw new HttpError(404, 'Student profile not found.');
     }
+    const storedFiles = storedResourceKeysForOwner(user.id);
+    db.run('DELETE FROM study_resources WHERE owner_id = ?', [user.id]);
     db.run('DELETE FROM students WHERE id = ?', [id]);
     await save();
+    await removeStoredResources(storedFiles);
+    res.status(204).end();
+  }),
+);
+
+app.get('/api/resources/programs', requireAuth, (_req, res) => {
+  const result = db.exec(
+    'SELECT DISTINCT program FROM students ORDER BY program COLLATE NOCASE',
+  );
+  res.json(result[0]?.values.map(([program]) => String(program)) ?? []);
+});
+
+app.get('/api/resources', requireAuth, (req, res) => {
+  const user = currentUser(req);
+  const studentProgram = currentStudentProgram(user);
+  const selectedProgram =
+    typeof req.query.program === 'string' ? req.query.program.trim() : '';
+  if (selectedProgram) {
+    const programStatement = db.prepare('SELECT 1 FROM students WHERE program = ? LIMIT 1');
+    programStatement.bind([selectedProgram]);
+    const exists = programStatement.step();
+    programStatement.free();
+    if (!exists) throw new HttpError(400, 'Choose a program in the directory.');
+  }
+  const statement = db.prepare(`
+    SELECT resources.id, resources.owner_id, resources.title, resources.program,
+      resources.file_name, resources.mime_type, resources.file_size,
+      resources.kind, resources.announcement_body, resources.clip_start_seconds,
+      resources.clip_end_seconds, resources.audience, resources.created_at,
+      COALESCE(students.name, 'Student') AS uploader_name
+    FROM study_resources AS resources
+    LEFT JOIN students ON students.owner_id = resources.owner_id
+    WHERE (resources.audience = 'all' AND (? = '' OR resources.program = ?))
+      OR (resources.audience = 'program' AND resources.program = ?
+        AND (? = '' OR resources.program = ?))
+    ORDER BY resources.created_at DESC
+  `);
+  statement.bind([
+    selectedProgram,
+    selectedProgram,
+    studentProgram,
+    selectedProgram,
+    selectedProgram,
+  ]);
+  const resources: Array<Record<string, unknown>> = [];
+  while (statement.step()) {
+    const row = statement.getAsObject();
+    resources.push({
+      id: Number(row.id),
+      title: String(row.title),
+      program: String(row.program),
+      kind: String(row.kind),
+      fileName: String(row.file_name) || null,
+      mimeType: String(row.mime_type) || null,
+      fileSize: Number(row.file_size),
+      announcementBody: String(row.announcement_body) || null,
+      clipStartSeconds: row.clip_start_seconds == null
+        ? null
+        : Number(row.clip_start_seconds),
+      clipEndSeconds: row.clip_end_seconds == null
+        ? null
+        : Number(row.clip_end_seconds),
+      audience: String(row.audience),
+      uploadedAt: String(row.created_at),
+      uploaderName: String(row.uploader_name),
+      isOwnedByCurrentUser: Number(row.owner_id) === user.id,
+    });
+  }
+  statement.free();
+  res.json(resources);
+});
+
+app.post(
+  '/api/resources',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const user = currentUser(req);
+    currentStudentProgram(user);
+    const resource = parseStudyAnnouncement(req.body);
+    validateResourceProgram(resource.program);
+    assertStudyResourceCapacity(user.id);
+    const now = new Date().toISOString();
+    db.run(
+      `INSERT INTO study_resources
+        (owner_id, title, program, file_name, mime_type, file_data, storage_key,
+         file_size, kind, announcement_body, clip_start_seconds, clip_end_seconds,
+         audience, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, 0, ?, ?, NULL, NULL, ?, ?)`,
+      [
+        user.id,
+        resource.title,
+        resource.program,
+        resource.fileName,
+        resource.mimeType,
+        '',
+        resource.kind,
+        resource.announcementBody,
+        resource.audience,
+        now,
+      ],
+    );
+    const id = Number(db.exec('SELECT last_insert_rowid() AS id')[0].values[0][0]);
+    await save();
+    res.status(201).json({
+      id,
+      title: resource.title,
+      program: resource.program,
+      kind: resource.kind,
+      fileName: null,
+      mimeType: null,
+      fileSize: 0,
+      announcementBody: resource.announcementBody,
+      clipStartSeconds: null,
+      clipEndSeconds: null,
+      audience: resource.audience,
+      uploadedAt: now,
+      uploaderName: 'You',
+      isOwnedByCurrentUser: true,
+    });
+  }),
+);
+
+app.post(
+  '/api/resources/upload',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const user = currentUser(req);
+    currentStudentProgram(user);
+    const mimeType = (req.get('content-type') ?? '').split(';', 1)[0].toLowerCase();
+    const resource = parseStudyResourceUpload(req.query, mimeType);
+    validateResourceProgram(resource.program);
+    assertStudyResourceCapacity(user.id);
+
+    const extension = resource.fileName.slice(resource.fileName.lastIndexOf('.')).toLowerCase();
+    const storageKey = `${randomBytes(16).toString('hex')}${extension}`;
+    const temporaryPath = join(studyResourceStorageDir, `${storageKey}.part`);
+    const destinationPath = resourceStoragePath(storageKey);
+    let fileSize = 0;
+    let fileTooLarge = false;
+    let signature = Buffer.alloc(0);
+    const inspectFile = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        if (fileTooLarge) {
+          callback();
+          return;
+        }
+        fileSize += chunk.length;
+        if (fileSize > MAX_STUDY_RESOURCE_BYTES) {
+          fileTooLarge = true;
+          callback();
+          return;
+        }
+        if (signature.length < 12) {
+          signature = Buffer.concat([
+            signature,
+            chunk.subarray(0, 12 - signature.length),
+          ]);
+        }
+        callback(null, chunk);
+      },
+    });
+
+    try {
+      await pipeline(req, inspectFile, createWriteStream(temporaryPath, { flags: 'wx' }));
+      if (fileTooLarge) {
+        throw new HttpError(413, 'Files and videos must be 500 MB or smaller.');
+      }
+      if (fileSize === 0) throw new HttpError(400, 'Choose a non-empty file.');
+      if (!hasValidResourceSignature(extension, signature)) {
+        throw new HttpError(400, 'The file content does not match its file type.');
+      }
+      assertStudyResourceCapacity(user.id);
+      await rename(temporaryPath, destinationPath);
+      const now = new Date().toISOString();
+      db.run(
+        `INSERT INTO study_resources
+          (owner_id, title, program, file_name, mime_type, file_data, storage_key,
+           file_size, kind, announcement_body, clip_start_seconds, clip_end_seconds,
+           audience, created_at)
+         VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, '', ?, ?, ?, ?)`,
+        [
+          user.id,
+          resource.title,
+          resource.program,
+          resource.fileName,
+          resource.mimeType,
+          storageKey,
+          fileSize,
+          resource.kind,
+          resource.clipStartSeconds,
+          resource.clipEndSeconds,
+          resource.audience,
+          now,
+        ],
+      );
+      const id = Number(db.exec('SELECT last_insert_rowid() AS id')[0].values[0][0]);
+      try {
+        await save();
+      } catch (error) {
+        db.run('DELETE FROM study_resources WHERE id = ?', [id]);
+        throw error;
+      }
+      res.status(201).json({
+        id,
+        title: resource.title,
+        program: resource.program,
+        kind: resource.kind,
+        fileName: resource.fileName,
+        mimeType: resource.mimeType,
+        fileSize,
+        announcementBody: null,
+        clipStartSeconds: resource.clipStartSeconds,
+        clipEndSeconds: resource.clipEndSeconds,
+        audience: resource.audience,
+        uploadedAt: now,
+        uploaderName: 'You',
+        isOwnedByCurrentUser: true,
+      });
+    } catch (error) {
+      await rm(temporaryPath, { force: true });
+      await rm(destinationPath, { force: true });
+      throw error;
+    }
+  }),
+);
+
+app.get('/api/resources/:id/download', requireAuth, (req, res, next) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) {
+    res.status(400).json({ error: 'A valid resource ID is required.' });
+    return;
+  }
+  const user = currentUser(req);
+  const studentProgram = currentStudentProgram(user);
+  const statement = db.prepare(`
+    SELECT file_name, mime_type, file_data, storage_key, file_size, kind
+    FROM study_resources
+    WHERE id = ? AND (audience = 'all' OR program = ?)
+  `);
+  statement.bind([id, studentProgram]);
+  const resource = statement.step() ? statement.getAsObject() : undefined;
+  statement.free();
+  if (!resource || String(resource.kind) === 'announcement') {
+    res.status(404).json({ error: 'Study resource not found.' });
+    return;
+  }
+  const fileName = String(resource.file_name);
+  const downloadName = fileName.replace(/[^A-Za-z0-9._-]/g, '_') || 'study-resource';
+  res.setHeader('Content-Type', String(resource.mime_type));
+  const isVideo = String(resource.kind) === 'video';
+  res.setHeader(
+    'Content-Disposition',
+    `${isVideo && req.query.download !== '1' ? 'inline' : 'attachment'}; filename="${downloadName}"`,
+  );
+  res.setHeader('Cache-Control', 'no-store');
+  if (isVideo) res.setHeader('Accept-Ranges', 'bytes');
+
+  const fileSize = Number(resource.file_size);
+  let start = 0;
+  let end = fileSize - 1;
+  const range = req.get('Range');
+  if (isVideo && range) {
+    const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+    if (!match || (!match[1] && !match[2])) {
+      res.setHeader('Content-Range', `bytes */${fileSize}`);
+      res.status(416).end();
+      return;
+    }
+    if (match[1]) {
+      start = Number(match[1]);
+      if (match[2]) end = Math.min(Number(match[2]), fileSize - 1);
+    } else {
+      const suffixLength = Number(match[2]);
+      start = Math.max(0, fileSize - suffixLength);
+    }
+    if (start >= fileSize || end < start || !Number.isSafeInteger(start) || !Number.isSafeInteger(end)) {
+      res.setHeader('Content-Range', `bytes */${fileSize}`);
+      res.status(416).end();
+      return;
+    }
+    res.status(206);
+    res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+  }
+  res.setHeader('Content-Length', String(end - start + 1));
+  const storageKey = resource.storage_key == null ? '' : String(resource.storage_key);
+  const stream = storageKey
+    ? createReadStream(resourceStoragePath(storageKey), { start, end })
+    : Readable.from([
+        Buffer.from(String(resource.file_data).slice(String(resource.file_data).indexOf(',') + 1), 'base64')
+          .subarray(start, end + 1),
+      ]);
+  stream.on('error', (error: Error) => {
+    if (res.headersSent) res.destroy(error);
+    else next(error);
+  });
+  stream.pipe(res);
+});
+
+app.delete(
+  '/api/resources/:id',
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id < 1) {
+      throw new HttpError(400, 'A valid resource ID is required.');
+    }
+    const user = currentUser(req);
+    const resourceStatement = db.prepare(
+      'SELECT storage_key FROM study_resources WHERE id = ? AND owner_id = ?',
+    );
+    resourceStatement.bind([id, user.id]);
+    const resource = resourceStatement.step()
+      ? resourceStatement.getAsObject()
+      : undefined;
+    resourceStatement.free();
+    if (!resource) throw new HttpError(404, 'Study resource not found.');
+    const statement = db.prepare(
+      'DELETE FROM study_resources WHERE id = ? AND owner_id = ?',
+    );
+    statement.run([id, user.id]);
+    const deleted = db.getRowsModified() > 0;
+    statement.free();
+    if (!deleted) throw new HttpError(404, 'Study resource not found.');
+    await save();
+    if (resource.storage_key != null) {
+      await removeStoredResources([String(resource.storage_key)]);
+    }
     res.status(204).end();
   }),
 );

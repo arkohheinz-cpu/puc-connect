@@ -27,6 +27,44 @@ export type StudentStats = {
   recentlyJoined: number;
 };
 
+export type ResourceAudience = 'program' | 'all';
+export type StudyResourceKind = 'file' | 'video' | 'announcement';
+
+export type StudyResource = {
+  id: number;
+  title: string;
+  program: string;
+  kind: StudyResourceKind;
+  fileName: string | null;
+  mimeType: string | null;
+  fileSize: number;
+  announcementBody: string | null;
+  clipStartSeconds: number | null;
+  clipEndSeconds: number | null;
+  audience: ResourceAudience;
+  uploadedAt: string;
+  uploaderName: string;
+  isOwnedByCurrentUser: boolean;
+};
+
+export type StudyResourceInput = {
+  title: string;
+  program: string;
+  audience: ResourceAudience;
+  kind: 'announcement';
+  announcementBody: string;
+};
+
+export type StudyResourceUploadInput = {
+  title: string;
+  program: string;
+  fileName: string;
+  mimeType: string;
+  audience: ResourceAudience;
+  clipStart?: string;
+  clipEnd?: string;
+};
+
 export type AuthUser = {
   id: number;
   email: string;
